@@ -19,9 +19,7 @@ import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
 
 /**
- * Self-contained video player using FFmpeg executable.
- * Decodes video frames and renders them in real-time.
- * Audio is played via Java's built-in audio system.
+ * Synchronized video player using FFmpeg with proper A/V sync
  */
 public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
     private Process ffmpegProcess;
@@ -43,28 +41,27 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
     private int videoWidth = 1280;
     private int videoHeight = 720;
     private float audioVolume = 1.0f;
+    private double actualFrameRate = 30.0; // Actual video frame rate
     
-    // Seek queue system - holds the next seek target
+    // Synchronization variables
+    private volatile long playbackStartTime = 0; // System time when playback started
+    private volatile long startPositionMs = 0;   // Video position where playback started
     private AtomicLong pendingSeekTimeMs = new AtomicLong(-1);
     private final Object seekLock = new Object();
+    private volatile boolean isUpdatingUI = false;
 
     public FFmpegVideoPlayer(MediaControlBar controlBar, VideoPlayerModel model) {
         this.controlBar = controlBar;
         this.model = model;
         setBackground(Color.BLACK);
-        // Don't use setLayout(null) - let it use default FlowLayout or BorderLayout
         extractFFmpeg();
     }
 
-    /**
-     * Extract bundled FFmpeg executable from resources
-     */
     private void extractFFmpeg() {
         try {
             ffmpegBinary = FFmpegDownloader.getFFmpegBinary();
             System.out.println("[FFmpeg] Ready: " + ffmpegBinary.getAbsolutePath());
             
-            // Get ffprobe path
             if (ffmpegBinary != null && ffmpegBinary.exists()) {
                 String ffmpegDir = ffmpegBinary.getParent();
                 ffprobeBinary = new File(ffmpegDir, "ffprobe.exe");
@@ -83,8 +80,7 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
             currentVideoPath = file.getAbsolutePath();
             System.out.println("[FFmpeg] Loading: " + currentVideoPath);
             
-            // Get duration using ffprobe
-            getDuration();
+            getVideoInfo();
             
             controlBar.setVideoLoaded(true);
         } catch (Exception e) {
@@ -96,9 +92,9 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
     }
 
     /**
-     * Get video duration and dimensions using ffprobe
+     * Get video duration, dimensions, and frame rate using ffprobe
      */
-    private void getDuration() throws Exception {
+    private void getVideoInfo() throws Exception {
         if (ffprobeBinary == null || !ffprobeBinary.exists()) {
             System.err.println("[FFmpeg] ffprobe not found");
             return;
@@ -127,38 +123,45 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
             System.err.println("[FFmpeg] Could not parse duration: " + output);
         }
         
-        // Get video dimensions
+        // Get video dimensions and frame rate
         try {
             pb = new ProcessBuilder(
                 ffprobeBinary.getAbsolutePath(),
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
+                "-show_entries", "stream=width,height,r_frame_rate",
                 currentVideoPath
             );
             process = pb.start();
             is = process.getInputStream();
             data = is.readAllBytes();
             String dimOutput = new String(data).trim();
-            System.out.println("[FFmpeg] Dimension output:\n" + dimOutput);
+            System.out.println("[FFmpeg] Stream info:\n" + dimOutput);
             
-            // Parse width and height from output like:
-            // [STREAM]
-            // width=1280
-            // height=698
-            // [/STREAM]
             String[] lines = dimOutput.split("\n");
             for (String line : lines) {
                 if (line.startsWith("width=")) {
                     videoWidth = Integer.parseInt(line.substring(6).trim());
                 } else if (line.startsWith("height=")) {
                     videoHeight = Integer.parseInt(line.substring(7).trim());
+                } else if (line.startsWith("r_frame_rate=")) {
+                    String fpsStr = line.substring(13).trim();
+                    // Parse fraction like "30/1" or "24000/1001"
+                    if (fpsStr.contains("/")) {
+                        String[] parts = fpsStr.split("/");
+                        double num = Double.parseDouble(parts[0]);
+                        double den = Double.parseDouble(parts[1]);
+                        actualFrameRate = num / den;
+                    } else {
+                        actualFrameRate = Double.parseDouble(fpsStr);
+                    }
+                    System.out.println("[FFmpeg] Frame rate: " + String.format("%.2f", actualFrameRate) + " fps");
                 }
             }
-            System.out.println("[FFmpeg] Detected Resolution: " + videoWidth + "x" + videoHeight);
+            System.out.println("[FFmpeg] Resolution: " + videoWidth + "x" + videoHeight);
         } catch (Exception e) {
-            System.err.println("[FFmpeg] Could not get dimensions: " + e.getMessage());
-            System.out.println("[FFmpeg] Using default: 1280x720");
+            System.err.println("[FFmpeg] Could not get video info: " + e.getMessage());
+            System.out.println("[FFmpeg] Using defaults: 1280x720 @ 30fps");
         }
     }
 
@@ -173,19 +176,12 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
     }
 
     /**
-     * Start FFmpeg playback and frame rendering
-     * FFmpeg handles all timing, Java only renders frames
-     */
-    /**
-     * Start FFmpeg playback and frame rendering
-     * FFmpeg handles all timing and processing
-     * Java only renders frames to screen
+     * Start synchronized playback using system clock as master
      */
     private void startPlayback() {
         // Stop any existing playback
         stopPlayback = true;
         
-        // Kill old processes immediately
         if (ffmpegProcess != null) {
             ffmpegProcess.destroyForcibly();
         }
@@ -193,7 +189,31 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
             audioProcess.destroyForcibly();
         }
         
-        // Wait for old threads to die
+        waitForThreads();
+        
+        stopPlayback = false;
+        
+        // Set the master clock - use system time as reference
+        playbackStartTime = System.nanoTime();
+        startPositionMs = currentTimeMs;
+        
+        System.out.println("[FFmpeg] Starting synchronized playback at " + (currentTimeMs / 1000) + "s");
+        
+        // Start audio first (audio is typically the master clock)
+        startAudioPlayback();
+        
+        // Small delay to ensure audio starts first
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        
+        // Start video decode thread
+        startVideoPlayback();
+    }
+    
+    private void waitForThreads() {
         if (decodeThread != null && decodeThread.isAlive()) {
             try {
                 decodeThread.join(500);
@@ -208,23 +228,21 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                 Thread.currentThread().interrupt();
             }
         }
-        
-        // Reset flag for new playback
-        stopPlayback = false;
-        System.out.println("[FFmpeg] Starting playback at " + (currentTimeMs / 1000) + "s");
-        
-        // Start audio thread
-        startAudioPlayback();
-        
-        // Start decode thread
+    }
+
+    /**
+     * Start video playback with proper synchronization to master clock
+     */
+    private void startVideoPlayback() {
         decodeThread = new Thread(() -> {
             try {
-                // Outer loop - restarts when seeking
+                // Calculate frame duration in nanoseconds
+                long frameDurationNs = (long) ((1.0 / actualFrameRate) * 1_000_000_000);
+                
                 while (isPlaying && !stopPlayback) {
                     List<String> cmd = new ArrayList<>();
                     cmd.add(ffmpegBinary.getAbsolutePath());
                     
-                    // Seek to position if needed
                     if (currentTimeMs > 0) {
                         cmd.add("-ss");
                         cmd.add(String.valueOf(currentTimeMs / 1000.0));
@@ -238,15 +256,16 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                     cmd.add("rgb24");
                     cmd.add("-vf");
                     cmd.add("scale=" + videoWidth + ":" + videoHeight);
+                    // Use actual frame rate instead of hardcoded 30
                     cmd.add("-r");
-                    cmd.add("30");
+                    cmd.add(String.valueOf(actualFrameRate));
                     cmd.add("-an");
                     cmd.add("-");
                     
                     ProcessBuilder pb = new ProcessBuilder(cmd);
                     pb.redirectError(ProcessBuilder.Redirect.DISCARD);
                     ffmpegProcess = pb.start();
-                    System.out.println("[FFmpeg] Process started at " + (currentTimeMs / 1000) + "s");
+                    System.out.println("[Video] Process started at " + (currentTimeMs / 1000) + "s");
                     
                     InputStream in = ffmpegProcess.getInputStream();
                     int frameSize = videoWidth * videoHeight * 3;
@@ -254,39 +273,38 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                     int frameCount = 0;
                     boolean seekDetected = false;
                     
-                    // Inner loop - read frames until seek or stop
-                    while (isPlaying && !stopPlayback && !seekDetected && in.available() >= 0 && ffmpegProcess.isAlive()) {
-                        // Check for pending seek request
+                    while (isPlaying && !stopPlayback && !seekDetected && ffmpegProcess.isAlive()) {
+                        // Check for seek
                         long pendingSeek = pendingSeekTimeMs.getAndSet(-1);
                         if (pendingSeek >= 0 && pendingSeek != currentTimeMs) {
-                            System.out.println("[FFmpeg] Seek detected: " + (currentTimeMs / 1000) + "s -> " + (pendingSeek / 1000) + "s");
+                            System.out.println("[Video] Seek: " + (currentTimeMs / 1000) + "s -> " + (pendingSeek / 1000) + "s");
                             currentTimeMs = pendingSeek;
                             seekDetected = true;
                             
-                            // Kill current process
                             if (ffmpegProcess != null) {
                                 ffmpegProcess.destroyForcibly();
                             }
+                            
                             // Restart audio at new position
-                            if (audioThread != null && audioThread.isAlive()) {
-                                if (audioProcess != null) {
-                                    audioProcess.destroyForcibly();
-                                }
-                                try {
-                                    audioThread.join(100);  // Reduced from 300ms for faster seeking
-                                } catch (InterruptedException e) {
-                                    Thread.currentThread().interrupt();
-                                }
-                            }
-                            startAudioPlayback();
-                            break;  // Break inner loop to restart outer loop with new position
+                            restartAudio();
+                            
+                            // Reset master clock
+                            playbackStartTime = System.nanoTime();
+                            startPositionMs = currentTimeMs;
+                            
+                            break;
                         }
                         
+                        // Calculate expected time based on master clock
+                        long elapsedNs = System.nanoTime() - playbackStartTime;
+                        long expectedTimeMs = startPositionMs + (elapsedNs / 1_000_000);
+                        
+                        // Read frame
                         int totalRead = 0;
                         while (totalRead < frameSize && !stopPlayback && !seekDetected) {
                             int nRead = in.read(frameData, totalRead, frameSize - totalRead);
                             if (nRead == -1) {
-                                System.out.println("[FFmpeg] EOF reached");
+                                System.out.println("[Video] EOF reached");
                                 stopPlayback = true;
                                 isPlaying = false;
                                 controlBar.setPlaying(false);
@@ -300,9 +318,32 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                         }
                         
                         frameCount++;
+                        
+                        // Update current time from master clock
+                        currentTimeMs = expectedTimeMs;
+                        
+                        // Calculate when this frame should be displayed
+                        long frameTimeMs = startPositionMs + (frameCount * 1000 / (long)actualFrameRate);
+                        long displayTimeNs = playbackStartTime + (frameTimeMs - startPositionMs) * 1_000_000;
+                        long currentNs = System.nanoTime();
+                        long waitNs = displayTimeNs - currentNs;
+                        
+                        // If we're behind, skip sleeping
+                        if (waitNs > 0) {
+                            try {
+                                Thread.sleep(waitNs / 1_000_000, (int)(waitNs % 1_000_000));
+                            } catch (InterruptedException e) {
+                                break;
+                            }
+                        } else if (waitNs < -frameDurationNs * 2) {
+                            // If we're more than 2 frames behind, drop this frame
+                            System.out.println("[Video] Dropping frame " + frameCount + " (late by " + (-waitNs / 1_000_000) + "ms)");
+                            continue;
+                        }
+                        
                         final byte[] frameCopy = frameData.clone();
                         
-                        // Render frame asynchronously
+                        // Render frame
                         frameProcessingPool.execute(() -> {
                             try {
                                 BufferedImage frame = new BufferedImage(videoWidth, videoHeight, BufferedImage.TYPE_INT_RGB);
@@ -323,54 +364,34 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                             }
                         });
                         
-                        // Update time
-                        currentTimeMs = currentTimeMs + 33;
-                        
                         if (frameCount % 30 == 0) {
-                            System.out.println("[FFmpeg] Frame " + frameCount + " @ " + (currentTimeMs / 1000) + "s");
-                        }
-                        
-                        try {
-                            Thread.sleep(3);  // Reduced from 10ms for faster responsiveness
-                        } catch (InterruptedException e) {
-                            break;
+                            long drift = expectedTimeMs - frameTimeMs;
+                            System.out.println("[Video] Frame " + frameCount + " @ " + (expectedTimeMs / 1000) + "s (drift: " + drift + "ms)");
                         }
                     }
                     
-                    // If not seeking, we're done
                     if (!seekDetected) {
                         break;
                     }
                 }
                 
-                System.out.println("[FFmpeg] Playback ended");
+                System.out.println("[Video] Playback ended");
                 if (ffmpegProcess != null) {
                     ffmpegProcess.destroy();
                 }
             } catch (Exception e) {
-                System.err.println("[FFmpeg] Error: " + e.getMessage());
+                System.err.println("[Video] Error: " + e.getMessage());
+                e.printStackTrace();
             }
         });
-        decodeThread.setName("FFmpeg-Decode");
+        decodeThread.setName("FFmpeg-Video");
         decodeThread.start();
     }
 
     /**
-     * Start audio playback using FFmpeg and Java's audio system
+     * Start audio playback
      */
     private void startAudioPlayback() {
-        // Stop old audio thread if running
-        if (audioThread != null && audioThread.isAlive()) {
-            if (audioProcess != null) {
-                audioProcess.destroyForcibly();
-            }
-            try {
-                audioThread.join(300);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        
         audioThread = new Thread(() -> {
             try {
                 List<String> cmd = new ArrayList<>();
@@ -381,7 +402,6 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                     cmd.add(String.valueOf(currentTimeMs / 1000.0));
                 }
                 
-                // Faster FFmpeg initialization for quicker seeks
                 cmd.add("-analyzeduration");
                 cmd.add("0");
                 cmd.add("-probesize");
@@ -407,7 +427,7 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                 audioLine.open(audioFormat);
                 audioLine.start();
                 
-                System.out.println("[Audio] Playing: 44100Hz, 16-bit, Stereo");
+                System.out.println("[Audio] Started at " + (currentTimeMs / 1000) + "s");
                 
                 InputStream audioIn = audioProcess.getInputStream();
                 byte[] audioBuffer = new byte[4096];
@@ -420,7 +440,7 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                     audioLine.write(audioBuffer, 0, bytesRead);
                 }
                 
-                System.out.println("[Audio] Playback ended");
+                System.out.println("[Audio] Ended");
                 if (audioLine != null && audioLine.isOpen()) {
                     audioLine.drain();
                     audioLine.stop();
@@ -435,19 +455,25 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
         audioThread.start();
     }
     
-    /**
-     * Apply volume to audio buffer
-     */
+    private void restartAudio() {
+        if (audioThread != null && audioThread.isAlive()) {
+            if (audioProcess != null) {
+                audioProcess.destroyForcibly();
+            }
+            try {
+                audioThread.join(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        startAudioPlayback();
+    }
+    
     private void applyVolume(byte[] buffer, int length) {
         for (int i = 0; i < length; i += 2) {
-            // Convert bytes to short (16-bit signed)
             int sample = ((buffer[i + 1] & 0xFF) << 8) | (buffer[i] & 0xFF);
             short shortSample = (short) sample;
-            
-            // Apply volume
             shortSample = (short) (shortSample * audioVolume);
-            
-            // Convert back to bytes
             buffer[i] = (byte) (shortSample & 0xFF);
             buffer[i + 1] = (byte) ((shortSample >> 8) & 0xFF);
         }
@@ -460,7 +486,6 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
             controlBar.setPlaying(false);
             stopPlayback = true;
             
-            // Force terminate processes immediately
             if (ffmpegProcess != null) {
                 ffmpegProcess.destroyForcibly();
             }
@@ -494,23 +519,18 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
     @Override
     public void seek(long timeMs) {
         long newTimeMs = Math.min(timeMs, durationMs);
-        System.out.println("[FFmpeg] Seek requested to " + (newTimeMs / 1000) + "s");
+        System.out.println("[FFmpeg] Seek to " + (newTimeMs / 1000) + "s");
         
-        // Queue up the seek - don't interrupt current playback
         synchronized (seekLock) {
             pendingSeekTimeMs.set(newTimeMs);
         }
-        
-        // UI will be updated by decode thread after successful seek
     }
 
     @Override
     public void setVolume(int volume) {
-        // volume is 0-100
         audioVolume = Math.max(0.0f, Math.min(1.0f, volume / 100.0f));
-        System.out.println("[Audio] Volume: " + volume + "% (" + String.format("%.2f", audioVolume) + ")");
+        System.out.println("[Audio] Volume: " + volume + "%");
         
-        // Also update audio line if available
         if (audioLine != null && audioLine.isOpen()) {
             try {
                 if (audioLine.isControlSupported(javax.sound.sampled.FloatControl.Type.MASTER_GAIN)) {
@@ -518,7 +538,6 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                         (javax.sound.sampled.FloatControl) audioLine.getControl(
                             javax.sound.sampled.FloatControl.Type.MASTER_GAIN);
                     
-                    // Convert volume (0-1) to dB (-80 to 0)
                     float dB = audioVolume > 0 ? (float) (20 * Math.log10(audioVolume)) : -80;
                     dB = Math.max(gainControl.getMinimum(), Math.min(gainControl.getMaximum(), dB));
                     gainControl.setValue(dB);
@@ -545,7 +564,7 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
                 audioLine.stop();
                 audioLine.close();
             } catch (Exception e) {
-                System.err.println("[Audio] Error closing audio line: " + e.getMessage());
+                System.err.println("[Audio] Error closing: " + e.getMessage());
             }
         }
     }
@@ -558,29 +577,36 @@ public class FFmpegVideoPlayer extends JPanel implements IVideoPlayer {
     @Override
     public boolean isPlaying() {
         return isPlaying;
+    }    
+    
+    @Override
+    public boolean isUpdatingUI() {
+        return isUpdatingUI;
     }
 
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
         
-        // Debug: print once when we have a frame
         if (currentFrame != null) {
             g.drawImage(currentFrame, 0, 0, getWidth(), getHeight(), this);
             
-            // Update time display
-            controlBar.updateTime(
-                new SimpleDuration(currentTimeMs),
-                new SimpleDuration(durationMs)
-            );
+            isUpdatingUI = true;
+            try {
+                controlBar.updateTime(
+                    new SimpleDuration(currentTimeMs),
+                    new SimpleDuration(durationMs)
+                );
+            } finally {
+                isUpdatingUI = false;
+            }
         } else {
-            // Show loading message
             g.setColor(Color.WHITE);
             g.setFont(new Font("Arial", Font.PLAIN, 16));
             if (isPlaying) {
-                g.drawString("Decoding video... No frames yet", 20, getHeight() / 2);
+                g.drawString("Loading video...", getWidth() / 2 - 60, getHeight() / 2);
             } else {
-                g.drawString("No video loaded", getWidth() / 2 - 80, getHeight() / 2);
+                g.drawString("No video loaded", getWidth() / 2 - 60, getHeight() / 2);
             }
         }
     }
